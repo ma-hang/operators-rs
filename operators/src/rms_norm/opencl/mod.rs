@@ -128,7 +128,11 @@ impl Operator {
         let group_size = last_power_of_two(d.min(self.max_group_size));
         // 每线程可能处理多个数据
         let items_thread = d.div_ceil(group_size);
-        let key = SchemeKey { dt_a, dt_w, d };
+        let key = SchemeKey {
+            dt_a,
+            dt_w,
+            items_thread,
+        };
         self.schemes.lock().unwrap().get_or_insert(key, || {
             let dt_a = match dt_a {
                 Ty::F32 => "float",
@@ -160,7 +164,7 @@ const fn last_power_of_two(n: usize) -> usize {
 struct SchemeKey {
     dt_a: DigitLayout,
     dt_w: DigitLayout,
-    d: usize,
+    items_thread: usize,
 }
 
 #[cfg(test)]

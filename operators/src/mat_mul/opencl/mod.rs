@@ -30,8 +30,8 @@ impl crate::Operator for Operator {
             .iter()
             .map(|d| d.max_group_size())
             .min()
-            .unwrap()
-            / 2;
+            .unwrap();
+        // / 2;
         Self {
             ctx,
             max_group_size,
@@ -90,16 +90,56 @@ impl crate::Operator for Operator {
         let (lhs_cs, lhs_rs) = if a_trans { (1, a_ld) } else { (a_ld, 1) };
         let (rhs_cs, rhs_rs) = if b_trans { (1, b_ld) } else { (b_ld, 1) };
 
-        let mn = m * n;
+        let (key, groupsize_1) = self.cache_kernel(dt, m, n);
+        let mut ss = 1;
+        let mut mn = m * n;
+        let mut groupsize = groupsize_1;
+        if dt != Ty::F32 {
+            if lhs_cs == 1 && rhs_rs == 1 && n == 1 {
+                groupsize = 256;
+                let m_size = groupsize / 32;
+                if m % m_size == 0 {
+                    ss = if k % 1024 == 0 {
+                        mn *= 32;
+                        5
+                    } else if k % 256 == 0 {
+                        mn *= 32;
+                        4
+                    } else if k % 128 == 0 {
+                        mn *= 16;
+                        3
+                    } else if k % 32 == 0 {
+                        mn *= 32;
+                        2
+                    } else {
+                        ss // 保持默认
+                    };
+                } else if m == 122753 {
+                    let result = (m + 31) & !31;
+                    mn = result * n * 32;
+                    ss = 4;
+                }
+            }
+        }
+        if ss == 1 {
+            groupsize = groupsize_1;
+        }
+        let scheme_name = match ss {
+            1 => "general_gemm",
+            2 => "gemm_f16_v1",
+            3 => "gemm_f16_v2",
+            4 => "gemm_f16_v3",
+            5 => "gemm_f16_v4",
+            _ => unreachable!("Invalid ss value: {}", ss),
+        };
 
-        let (key, groupsize) = self.cache_kernel(dt, m, n);
         let mut matmul = self
             .schemes
             .lock()
             .unwrap()
             .get(&key)
             .unwrap()
-            .take("general_gemm")
+            .take(scheme_name)
             .unwrap();
 
         let queue = _queue_alloc.queue();
@@ -122,10 +162,20 @@ impl crate::Operator for Operator {
             .set_arg(15, k as cl_int)
             .set_arg(16, alpha)
             .set_arg(17, beta)
-            .launch(&[0, 0], &[batch, mn], &[1, groupsize], queue, None);
+            .launch(&[0, 0], &[mn, batch], &[groupsize, 1], queue, None);
         let mut cache = self.schemes.lock().unwrap();
         let program = cache.get(&key).unwrap();
-        program.put("general_gemm", matmul);
+        if ss == 1 {
+            program.put("general_gemm", matmul);
+        } else if ss == 2 {
+            program.put("gemm_f16_v1", matmul);
+        } else if ss == 3 {
+            program.put("gemm_f16_v2", matmul);
+        } else if ss == 4 {
+            program.put("gemm_f16_v3", matmul);
+        } else if ss == 5 {
+            program.put("gemm_f16_v4", matmul);
+        }
         Ok(())
     }
 }
@@ -138,7 +188,7 @@ impl Operator {
             1 => mn,
             _ => self.max_group_size,
         };
-        let key = SchemeKey { dt, m, n };
+        let key = SchemeKey { dt };
         self.schemes.lock().unwrap().get_or_insert(key, || {
             let dt = match dt {
                 Ty::F32 => "float",
@@ -164,8 +214,6 @@ impl Operator {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct SchemeKey {
     dt: DigitLayout,
-    m: usize,
-    n: usize,
 }
 
 #[cfg(test)]
