@@ -127,7 +127,7 @@ impl crate::Operator for Operator {
         let unit = dt_t.nbytes() as isize;
         if sd != unit || sp != dt_p.nbytes() as isize {
             return Err(strides_not_support("").into());
-        };
+        }
 
         let dh = dh / 2;
         let st = (st / unit / 2) as i32;
@@ -280,7 +280,7 @@ mod test {
         let dh = 64;
 
         let mut t = vec![0.0f64; NT * nh * dh];
-        rand::thread_rng().fill(&mut t[..]);
+        rand::rng().fill(&mut t[..]);
         let p: [u32; NT] = [0, 1, 2, 3, 7, 8, 1];
 
         let t_ans = gpu.apply(|ctx| {

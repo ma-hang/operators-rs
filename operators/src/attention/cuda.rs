@@ -2,24 +2,21 @@ impl_op!(cuda, Gpu);
 
 #[cfg(test)]
 mod test {
-    use super::{
-        super::{args::Meta, Args},
-        Operator,
-    };
+    use super::{super::Args, Operator};
     use crate::{cuda::Gpu, ByteOf, Hardware, Operator as _, TensorLayout};
     use digit_layout::{types as ty, DigitLayout};
 
     fn dyn_args<H: Hardware>(dt: DigitLayout, nh: usize, seq: usize, att: usize) -> Args<H> {
         use crate::dyn_;
-        Meta {
+        Args::new_null(
+            crate::fuesd_softmax::AttnMask::Causal,
             dt,
-            nh: nh.into(),
-            nkvh: dyn_(),
-            seq: seq.into(),
-            att: att.into(),
-            dh: dyn_(),
-        }
-        .into()
+            nh.into(),
+            dyn_(),
+            seq.into(),
+            att.into(),
+            dyn_(),
+        )
     }
 
     fn args<H: Hardware>(
@@ -43,6 +40,7 @@ mod test {
             k_base,
             v_base,
             o_base,
+            mask: crate::fuesd_softmax::AttnMask::Causal,
         }
     }
 
@@ -87,9 +85,9 @@ mod test {
         let mut k = vec![0.0f64; nkvh * att * dh];
         let mut v = vec![0.0f64; nkvh * att * dh];
         let o = vec![0.0f64; nh * seq * dh];
-        rand::thread_rng().fill(&mut q[..]);
-        rand::thread_rng().fill(&mut k[..]);
-        rand::thread_rng().fill(&mut v[..]);
+        rand::rng().fill(&mut q[..]);
+        rand::rng().fill(&mut k[..]);
+        rand::rng().fill(&mut v[..]);
         let k = k;
         let v = v;
 

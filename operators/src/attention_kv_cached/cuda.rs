@@ -21,6 +21,7 @@ mod test {
             TensorLayout::new_dyn(dt, &[nh.into(), seq.into(), dh.into()], &[dyn_(); 3]),
             TensorLayout::new_dyn(dt, &[nh.into(), seq.into(), dh.into()], &[dyn_(); 3]),
             TensorLayout::new_dyn(dt, &[nh.into(), seq.into(), dh.into()], &[dyn_(); 3]),
+            crate::fuesd_softmax::AttnMask::Causal,
             pos.into(),
         )
     }
@@ -46,13 +47,14 @@ mod test {
             o_layout: TensorLayout::new_contiguous(dt, &[nh, seq, dh]),
             k_cache_layout: TensorLayout::new_contiguous(dt, &[nkvh, seq + pos, dh]),
             v_cache_layout: TensorLayout::new_contiguous(dt, &[nkvh, seq + pos, dh]),
-            pos: pos.into(),
             q_base,
             k_base,
             v_base,
             o_base,
             k_cache_base,
             v_cache_base,
+            mask: crate::fuesd_softmax::AttnMask::Causal,
+            pos: pos.into(),
         }
     }
 
@@ -99,11 +101,11 @@ mod test {
         let o = vec![0.0f64; nh * seq * dh];
         let mut k_cache = vec![0.0f64; nkvh * (pos + seq) * dh];
         let mut v_cache = vec![0.0f64; nkvh * (pos + seq) * dh];
-        rand::thread_rng().fill(&mut q[..]);
-        rand::thread_rng().fill(&mut k[..]);
-        rand::thread_rng().fill(&mut v[..]);
-        rand::thread_rng().fill(&mut k_cache[..]);
-        rand::thread_rng().fill(&mut v_cache[..]);
+        rand::rng().fill(&mut q[..]);
+        rand::rng().fill(&mut k[..]);
+        rand::rng().fill(&mut v[..]);
+        rand::rng().fill(&mut k_cache[..]);
+        rand::rng().fill(&mut v_cache[..]);
         let k = k;
         let v = v;
 

@@ -1,20 +1,25 @@
 ﻿use super::{args::Meta, Args, Swiglu};
 use crate::{
     get_static,
-    opencl::{ClDevice, KernelCache},
-    strides_not_support, type_not_support,
+    opencl::{ClDevice, CodeGen, KernelCache, CL2_0},
+    strides_not_support,
     utils::gcd,
-    ByteOf, LaunchError, QueueAlloc, SchemeError,
+    ByteOf, LaunchError, QueueAlloc,
+    SchemeDiversity::Low as LowDiversity,
+    SchemeError,
 };
-use clrt::bindings::cl_int;
-use digit_layout::types::F32;
-use std::ffi::CString;
+use clrt::{bindings::cl_int, Context};
+use digit_layout::{types as Ty, DigitLayout};
+use lru::LruCache;
+use std::sync::Mutex;
 
-pub struct Operator(KernelCache);
+pub struct Operator {
+    ctx: Context,
+    max_group_size: usize,
+    schemes: Mutex<LruCache<SchemeKey, KernelCache>>,
+}
 
 impl Swiglu<ClDevice> for Operator {}
-
-const MAX_THREADS_PER_BLOCK: usize = 512;
 
 impl crate::Operator for Operator {
     type Hardware = ClDevice;
@@ -22,29 +27,38 @@ impl crate::Operator for Operator {
     type Args = Args<ClDevice>;
 
     fn new(node: &Self::TopoNode) -> Self {
-        const SRC: &str = include_str!("swiglu.cl");
-        let opts = CString::new("").unwrap();
-        Self(KernelCache::new(node.context(), SRC, &opts))
+        let ctx = node.context().clone();
+        let max_group_size = ctx
+            .devices()
+            .iter()
+            .map(|d| d.max_group_size())
+            .min()
+            .unwrap()
+            / 2;
+        Self {
+            ctx,
+            max_group_size,
+            schemes: node.new_cache(LowDiversity),
+        }
     }
 
     fn scheme(
         &mut self,
-        _args: &Self::Args,
+        args: &Self::Args,
         _max_workspace_size: usize,
     ) -> Result<usize, SchemeError> {
-        let Meta { dt, .. } = _args.meta()?;
-        if dt == F32 {
-            Ok(0)
-        } else {
-            Err(type_not_support("swiglu"))
+        let Meta { dt, d, .. } = args.meta()?;
+        if let Some(&d) = d.get_static() {
+            self.cache_kernel(dt, d);
         }
+        Ok(0)
     }
 
     fn launch<QA>(
         &self,
         args: &Self::Args,
         _workspace: &mut [ByteOf<Self::Hardware>],
-        _queue_alloc: &QA,
+        queue_alloc: &QA,
     ) -> Result<(), LaunchError>
     where
         QA: QueueAlloc<Hardware = Self::Hardware>,
@@ -63,10 +77,6 @@ impl crate::Operator for Operator {
             unreachable!()
         };
 
-        if dt != F32 {
-            return Err(type_not_support("swiglu").into());
-        }
-
         get_static! {
               n   d
             sgn sgd
@@ -75,36 +85,68 @@ impl crate::Operator for Operator {
 
         let unit = dt.nbytes() as isize;
         if sgd != unit || sud != unit {
-            return Err(strides_not_support("").into());
+            return Err(strides_not_support("opencl: swiglu").into());
         };
 
         let sg = (sgn / unit) as i32;
         let su: i32 = (sun / unit) as i32;
 
-        let name = "swiglu";
-        let local_worksize_y = gcd(MAX_THREADS_PER_BLOCK, d);
-        let global_workoffset = [0, 0];
-        let global_worksize = [n as usize, d as usize];
-        let local_worksize = [1, local_worksize_y];
+        let (key, group_size) = self.cache_kernel(dt, d);
 
-        let mut kernel = self.0.get_kernel(name).unwrap();
+        let mut swiglu = self
+            .schemes
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .take("swiglu")
+            .unwrap();
 
-        kernel
+        swiglu
             .set_arg(0, gate_base)
             .set_arg(1, (sg) as cl_int)
             .set_arg(2, up_base)
             .set_arg(3, (su) as cl_int)
             .launch(
-                &global_workoffset,
-                &global_worksize,
-                &local_worksize,
-                _queue_alloc.queue(),
+                &[0, 0],
+                &[n as usize, d as usize],
+                &[1, group_size],
+                queue_alloc.queue(),
                 None,
             );
 
-        self.0.set_kernel(name, kernel);
+        let mut cache = self.schemes.lock().unwrap();
+        let program = cache.get(&key).unwrap();
+        program.put("swiglu", swiglu);
         Ok(())
     }
+}
+
+impl Operator {
+    fn cache_kernel(&self, dt: DigitLayout, d: usize) -> (SchemeKey, usize) {
+        // 求最大公约数以便均匀划分工作项
+        let group_size = gcd(self.max_group_size, d);
+
+        let key = SchemeKey { dt, d };
+        self.schemes.lock().unwrap().get_or_insert(key, || {
+            let dt = match dt {
+                Ty::F32 => "float",
+                Ty::F16 => "half",
+                _ => unimplemented!(),
+            };
+            let src = CodeGen::new(include_str!("swiglu.cl"))
+                .define("Tval", dt)
+                .to_string();
+            KernelCache::new(&self.ctx, &src, CL2_0)
+        });
+        (key, group_size)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct SchemeKey {
+    dt: DigitLayout,
+    d: usize,
 }
 
 #[cfg(test)]
@@ -151,7 +193,7 @@ mod test {
             opencl::ClDevice,
             test_utils::{Diff, ErrorCollector},
         };
-        use clrt::{Invalid, Platform};
+        use clrt::Platform;
         use rand::Rng;
         use std::{iter::zip, time::Instant};
 
@@ -162,7 +204,7 @@ mod test {
 
                 let context = device.context();
                 let queue = context.queue();
-                let mut cl_op = Operator::new(&ClDevice::new(context.clone()));
+                let mut cl_op = Operator::new(&ClDevice::new(context.clone(), Default::default()));
                 cpu_op.scheme(&dyn_args(F64), 0).unwrap();
                 cl_op.scheme(&dyn_args(F32), 0).unwrap();
 
@@ -172,25 +214,23 @@ mod test {
                 let d = 5632;
                 let mut gate = vec![0.0f64; n * d];
                 let mut up = vec![0.0f64; n * d];
-                rand::thread_rng().fill(&mut gate[..]);
-                rand::thread_rng().fill(&mut up[..]);
+                rand::rng().fill(&mut gate[..]);
+                rand::rng().fill(&mut up[..]);
                 let up = up;
 
                 let mut gate_svm = context.malloc::<f32>(n * d);
                 let mut up_svm = context.malloc::<f32>(n * d);
 
-                let mut map = queue.map_mut(&mut gate_svm, Invalid);
-                let ([], mem, []) = (unsafe { map.write_only_slice().align_to_mut::<f32>() })
-                else {
+                let mut map = queue.map_mut(&mut gate_svm, false);
+                let ([], mem, []) = (unsafe { map.align_to_mut::<f32>() }) else {
                     panic!()
                 };
                 for (dst, src) in zip(mem, &gate) {
                     *dst = *src as _;
                 }
                 queue.unmap(map);
-                let mut map = queue.map_mut(&mut up_svm, Invalid);
-                let ([], mem, []) = (unsafe { map.write_only_slice().align_to_mut::<f32>() })
-                else {
+                let mut map = queue.map_mut(&mut up_svm, false);
+                let ([], mem, []) = (unsafe { map.align_to_mut::<f32>() }) else {
                     panic!()
                 };
                 for (dst, src) in zip(mem, &up) {

@@ -1,18 +1,22 @@
-﻿use super::{args::Scheme, Args, Rearrange};
+use super::{args::Scheme, Args, Rearrange};
 use crate::{
-    opencl::{ClDevice, KernelCache},
-    rank_not_support, ByteOf, LaunchError, QueueAlloc, SchemeError,
+    opencl::{ClDevice, CodeGen, KernelCache, CL2_0},
+    rank_not_support, ByteOf, LaunchError, QueueAlloc,
+    SchemeDiversity::Low as LowDiversity,
+    SchemeError,
 };
-use clrt::bindings::cl_int;
-use clrt::Invalid;
-use clrt::SvmByte;
-use std::{ffi::CString, ptr::copy_nonoverlapping};
+use clrt::{bindings::cl_int, Context};
+use lru::LruCache;
+use std::slice::{from_raw_parts, from_raw_parts_mut};
+use std::sync::Mutex;
 
-pub struct Operator(KernelCache);
+pub struct Operator {
+    ctx: Context,
+    max_group_size: usize,
+    schemes: Mutex<LruCache<SchemeKey, KernelCache>>,
+}
 
 impl Rearrange<ClDevice> for Operator {}
-
-const MAX_THREADS_PER_BLOCK: usize = 512;
 
 impl crate::Operator for Operator {
     type Hardware = ClDevice;
@@ -20,9 +24,19 @@ impl crate::Operator for Operator {
     type Args = Args<ClDevice>;
 
     fn new(node: &Self::TopoNode) -> Self {
-        const SRC: &str = include_str!("rearrange.cl");
-        let opts = CString::new("").unwrap();
-        Self(KernelCache::new(node.context(), SRC, &opts))
+        let ctx = node.context().clone();
+        let max_group_size = ctx
+            .devices()
+            .iter()
+            .map(|d| d.max_group_size())
+            .min()
+            .unwrap()
+            / 2;
+        Self {
+            ctx,
+            max_group_size,
+            schemes: node.new_cache(LowDiversity),
+        }
     }
 
     fn scheme(
@@ -30,9 +44,6 @@ impl crate::Operator for Operator {
         _args: &Self::Args,
         _max_workspace_size: usize,
     ) -> Result<usize, SchemeError> {
-        let kernel_name = "rearrange";
-        self.0
-            .set_kernel(kernel_name, self.0.get_kernel(kernel_name).unwrap());
         Ok(0)
     }
 
@@ -46,32 +57,13 @@ impl crate::Operator for Operator {
         QA: QueueAlloc<Hardware = Self::Hardware>,
     {
         let scheme = Scheme::new(args)?;
-        if scheme.ndim() == 0 {
-            let unit = scheme.unit();
-            let queue = queue_alloc.queue();
-            let ss: &[SvmByte] = unsafe { std::slice::from_raw_parts(args.src_base, unit / 4) };
-            let mut dd: &mut [SvmByte] =
-                unsafe { std::slice::from_raw_parts_mut(args.dst_base, unit / 4) };
-
-            let mut map_d = queue.map_mut(&mut dd, Invalid);
-            let ([], d_ans, []) = (unsafe { map_d.write_only_slice().align_to_mut::<u32>() })
-            else {
-                panic!()
-            };
-
-            let map_s = queue.map(ss);
-            let ([], s_ans, []) = (unsafe { map_s.align_to::<u32>() }) else {
-                panic!()
-            };
-            unsafe {
-                copy_nonoverlapping(s_ans.as_ptr(), d_ans.as_mut_ptr(), unit / 4);
-            }
-            queue.unmap(map_s);
-            queue.unmap(map_d);
-
+        let unit = scheme.unit();
+        if scheme.count() == 1 {
+            let dst = unsafe { from_raw_parts_mut(args.dst_base, unit) };
+            let src = unsafe { from_raw_parts(args.src_base, unit) };
+            queue_alloc.queue().memcpy(dst, src, None);
             return Ok(());
         }
-        let unit = scheme.unit();
 
         struct Layout {
             r: u32,
@@ -130,19 +122,16 @@ impl crate::Operator for Operator {
                 "rearrange not support ndim > 2 on Mobile GPU",
             ))?,
         };
-
         let unit_size = unit / 4;
-        let items_per_thread = unit_size.div_ceil(MAX_THREADS_PER_BLOCK);
-        let local_worksize_y = match items_per_thread {
-            1 => unit_size,
-            _ => MAX_THREADS_PER_BLOCK,
-        };
-        let name = "rearrange";
-        let global_workoffset = [0];
-        let global_worksize = [(r * c * (unit_size as u32)) as usize];
-        let local_worksize = [local_worksize_y];
-
-        let mut kernel = self.0.get_kernel(name).unwrap();
+        let (key, group_size) = self.cache_kernel(unit_size);
+        let mut rearrange = self
+            .schemes
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .take("rearrange")
+            .unwrap();
 
         let unit = unit as i32;
         let dst_rs = dst_rs / unit;
@@ -150,7 +139,7 @@ impl crate::Operator for Operator {
         let src_rs = src_rs / unit;
         let src_cs = src_cs / unit;
 
-        kernel
+        rearrange
             .set_arg(0, args.dst_base)
             .set_arg(1, dst_rs as cl_int)
             .set_arg(2, dst_cs as cl_int)
@@ -160,16 +149,39 @@ impl crate::Operator for Operator {
             .set_arg(6, c as cl_int)
             .set_arg(7, unit_size as cl_int)
             .launch(
-                &global_workoffset,
-                &global_worksize,
-                &local_worksize,
+                &[0],
+                &[(r * c * (unit_size as u32)) as usize],
+                &[group_size],
                 queue_alloc.queue(),
                 None,
             );
 
-        self.0.set_kernel(name, kernel);
+        let mut cache = self.schemes.lock().unwrap();
+        let program = cache.get(&key).unwrap();
+        program.put("rearrange", rearrange);
         Ok(())
     }
+}
+
+impl Operator {
+    fn cache_kernel(&self, unit_size: usize) -> (SchemeKey, usize) {
+        let items_per_thread = unit_size.div_ceil(self.max_group_size);
+        let group_size = match items_per_thread {
+            1 => unit_size,
+            _ => self.max_group_size,
+        };
+        let key = SchemeKey { unit_size };
+        self.schemes.lock().unwrap().get_or_insert(key, || {
+            let src = CodeGen::new(include_str!("rearrange.cl")).to_string();
+            KernelCache::new(&self.ctx, &src, CL2_0)
+        });
+        (key, group_size)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct SchemeKey {
+    unit_size: usize,
 }
 
 #[cfg(test)]
@@ -213,7 +225,7 @@ mod test {
             opencl::ClDevice,
             Operator as _,
         };
-        use clrt::{Invalid, Platform};
+        use clrt::Platform;
         use digit_layout::types as ty;
         use ndarray_layout::{ArrayLayout, Endian::BigEndian};
         use rand::Rng;
@@ -228,37 +240,18 @@ mod test {
 
                 let context = device.context();
                 let queue = context.queue();
-                let mut cl_op = Operator::new(&ClDevice::new(context.clone()));
+                let mut cl_op = Operator::new(&ClDevice::new(context.clone(), Default::default()));
 
-                // let nh = 32;
                 let nh = 5;
-                // let seq = 7;
                 let seq = 32;
-                // let dh = 128;
                 let dh = 64;
                 let mut src = vec![0u32; nh * seq * dh];
-                rand::thread_rng().fill(&mut src[..]);
+                rand::rng().fill(&mut src[..]);
                 let s_src =
                     ArrayLayout::<3>::new_contiguous(&[nh, seq, dh], BigEndian, dt.nbytes());
-                // let s_src = ArrayLayout::<3>::new(
-                //     &[nh, seq, dh],
-                //     &[0, (4 * dh) as isize, 4],
-                //     // dt.nbytes().unwrap(),
-                //     0,
-                // );
-                // let s_src = ArrayLayout::<3>::new(
-                //     &[nh, seq, dh],
-                //     &[(40 * dh) as isize, (4 * dh) as isize, 4],
-                //     // dt.nbytes().unwrap(),
-                //     0,
-                // );
-                let s_dst = ArrayLayout::<3>::new_contiguous(
-                    &[seq, nh, dh],
-                    BigEndian,
-                    // dt.nbytes().unwrap(),
-                    dt.nbytes(),
-                )
-                .transpose(&[1, 0]);
+                let s_dst =
+                    ArrayLayout::<3>::new_contiguous(&[seq, nh, dh], BigEndian, dt.nbytes())
+                        .transpose(&[1, 0]);
 
                 let dt = ty::U32;
                 cpu_op.scheme(&dyn_args(dt), 0).unwrap();
@@ -267,9 +260,8 @@ mod test {
                 let mut s_svm = context.malloc::<u32>(nh * seq * dh * 2);
                 let mut d_svm = context.malloc::<u32>(nh * seq * dh);
 
-                let mut map = queue.map_mut(&mut s_svm, Invalid);
-                let ([], mem, []) = (unsafe { map.write_only_slice().align_to_mut::<u32>() })
-                else {
+                let mut map = queue.map_mut(&mut s_svm, false);
+                let ([], mem, []) = (unsafe { map.align_to_mut::<u32>() }) else {
                     panic!()
                 };
                 for (dst, src) in zip(mem, &src) {

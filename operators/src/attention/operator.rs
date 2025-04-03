@@ -79,10 +79,10 @@ where
             )?);
 
             let layout = TensorLayout::new_dyn(dt, &[nh, seq, att], &[dyn_(); 3]);
-            wc.push_sub(
-                self.softmax
-                    .scheme(&fuesd_softmax::Args::new_null(layout), max_workspace_size)?,
-            );
+            wc.push_sub(self.softmax.scheme(
+                &fuesd_softmax::Args::new_null(args.mask, layout),
+                max_workspace_size,
+            )?);
 
             let layout = TensorLayout::new_dyn(dt, &[dyn_(); 3], &[dyn_(); 3]);
             wc.push_sub(self.rearrange.scheme(
@@ -116,7 +116,7 @@ where
         )?);
         // att = softmax(att)
         wc.push_sub(self.softmax.scheme(
-            &fuesd_softmax::Args::new_null(att_layout.clone()),
+            &fuesd_softmax::Args::new_null(args.mask, att_layout.clone()),
             workspace_size,
         )?);
         // q = att . v
@@ -151,6 +151,7 @@ where
             dh,
         } = args.meta()?;
         let Args {
+            mask,
             q_layout,
             q_base,
             k_layout,
@@ -180,7 +181,7 @@ where
         fn layout(shape: [usize; 3], strides: [isize; 3]) -> ArrayLayout<3> {
             ArrayLayout::new(&shape, &strides, 0)
         }
-        let qx = layout([nh, seq, dh], [nh_sq, seq_sq, dh_sq]).merge(0..2);
+        let qx = layout([nh, seq, dh], [nh_sq, seq_sq, dh_sq]).merge_be(0, 2);
         let k_layout = layout([nkvh, att, dh], [nkvh_sk, att_sk, dh_sk]).transpose(&[2, 1]);
 
         let q_size = if qx.is_none() { nh * seq * dh * ele } else { 0 };
@@ -237,6 +238,7 @@ where
         // att = softmax(att)
         self.softmax.launch(
             &fuesd_softmax::Args {
+                att_mask: *mask,
                 att_layout: att_softmax,
                 att_base: att_buf.as_mut_ptr(),
             },

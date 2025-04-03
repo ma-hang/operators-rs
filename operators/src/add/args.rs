@@ -1,4 +1,4 @@
-﻿use crate::{
+use crate::{
     get_static, rank_mismatch, shape_mismatch, shape_not_support, utils::type_distinct, ConstPtr,
     Hardware, MutPtr, SchemeError, TensorLayout,
 };

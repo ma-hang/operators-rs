@@ -1,15 +1,22 @@
-﻿use super::{args::SchemeLayout, Args, MatMul};
+use super::{args::SchemeLayout, Args, MatMul};
 use crate::{
-    opencl::{ClDevice, KernelCache},
-    ByteOf, LaunchError, QueueAlloc, SchemeError,
+    opencl::{ClDevice, CodeGen, KernelCache, CL2_0},
+    ByteOf, LaunchError, QueueAlloc,
+    SchemeDiversity::Low as LowDiversity,
+    SchemeError,
 };
-use clrt::bindings::cl_int;
-use std::ffi::CString;
-pub struct Operator(KernelCache);
+use clrt::{bindings::cl_int, Context};
+use digit_layout::{types as Ty, DigitLayout};
+use lru::LruCache;
+use std::sync::Mutex;
+
+pub struct Operator {
+    ctx: Context,
+    max_group_size: usize,
+    schemes: Mutex<LruCache<SchemeKey, KernelCache>>,
+}
 
 impl MatMul<ClDevice> for Operator {}
-
-const MAX_THREADS_PER_BLOCK: usize = 512;
 
 impl crate::Operator for Operator {
     type Hardware = ClDevice;
@@ -17,9 +24,19 @@ impl crate::Operator for Operator {
     type Args = Args<ClDevice>;
 
     fn new(node: &Self::TopoNode) -> Self {
-        const SRC: &str = include_str!("mat_mul.cl");
-        let opts = CString::new("").unwrap();
-        Self(KernelCache::new(node.context(), SRC, &opts))
+        let ctx = node.context().clone();
+        let max_group_size = ctx
+            .devices()
+            .iter()
+            .map(|d| d.max_group_size())
+            .min()
+            .unwrap()
+            / 2;
+        Self {
+            ctx,
+            max_group_size,
+            schemes: node.new_cache(LowDiversity),
+        }
     }
 
     fn scheme(
@@ -40,6 +57,7 @@ impl crate::Operator for Operator {
         QA: QueueAlloc<Hardware = Self::Hardware>,
     {
         let SchemeLayout {
+            dt,
             ab_swap,
             a_trans,
             b_trans,
@@ -72,36 +90,20 @@ impl crate::Operator for Operator {
         let (lhs_cs, lhs_rs) = if a_trans { (1, a_ld) } else { (a_ld, 1) };
         let (rhs_cs, rhs_rs) = if b_trans { (1, b_ld) } else { (b_ld, 1) };
 
-        let global_workoffset = [0, 0];
-        let mut name = "";
-        let mut global_worksize = [1, 1];
-        let mut local_worksize = [1, 1];
+        let mn = m * n;
 
-        if n == 1 {
-            if m % 32 == 0 {
-                name = "gemv_f32";
-                global_worksize = [m as usize, n * batch as usize];
-                local_worksize = [32 as usize, 1 as usize];
-            } else {
-                name = "gemv_f32v2";
-                global_worksize = [m as usize, n * k * batch as usize];
-                local_worksize = [1 as usize, k as usize];
-            }
-        } else if n != 1 {
-            let mn = m * n;
-            let items_per_thread = mn.div_ceil(MAX_THREADS_PER_BLOCK);
-            let local_worksize_y = match items_per_thread {
-                1 => mn,
-                _ => MAX_THREADS_PER_BLOCK,
-            };
-            name = "general_gemm_f32";
-            global_worksize = [batch as usize, mn as usize];
-            local_worksize = [1 as usize, local_worksize_y as usize];
-        }
+        let (key, groupsize) = self.cache_kernel(dt, m, n);
+        let mut matmul = self
+            .schemes
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .take("general_gemm")
+            .unwrap();
 
-        let mut kernel = self.0.get_kernel(name).unwrap();
         let queue = _queue_alloc.queue();
-        kernel
+        matmul
             .set_arg(0, a)
             .set_arg(1, b)
             .set_arg(2, c_base)
@@ -119,17 +121,51 @@ impl crate::Operator for Operator {
             .set_arg(14, n as cl_int)
             .set_arg(15, k as cl_int)
             .set_arg(16, alpha)
-            .set_arg(17, beta) //;
-            .launch(
-                &global_workoffset,
-                &global_worksize,
-                &local_worksize,
-                queue,
-                None,
-            );
-        self.0.set_kernel(name, kernel);
+            .set_arg(17, beta)
+            .launch(&[0, 0], &[batch, mn], &[1, groupsize], queue, None);
+        let mut cache = self.schemes.lock().unwrap();
+        let program = cache.get(&key).unwrap();
+        program.put("general_gemm", matmul);
         Ok(())
     }
+}
+
+impl Operator {
+    fn cache_kernel(&self, dt: DigitLayout, m: usize, n: usize) -> (SchemeKey, usize) {
+        let mn = m * n;
+        let items_per_thread = mn.div_ceil(self.max_group_size);
+        let group_size = match items_per_thread {
+            1 => mn,
+            _ => self.max_group_size,
+        };
+        let key = SchemeKey { dt, m, n };
+        self.schemes.lock().unwrap().get_or_insert(key, || {
+            let dt = match dt {
+                Ty::F32 => "float",
+                Ty::F16 => "half",
+                _ => unimplemented!(),
+            };
+            let src = match dt {
+                "float" => CodeGen::new(include_str!("mat_mul.cl"))
+                    .define("Tval", dt)
+                    .to_string(),
+                "half" => CodeGen::new(include_str!("mat_mul.cl"))
+                    .define("Tval", dt)
+                    .define("USE_HALF", true)
+                    .to_string(), // 只有 F16 类型时才定义 USE_HALF
+                _ => unimplemented!(),
+            };
+            KernelCache::new(&self.ctx, &src, CL2_0)
+        });
+        (key, group_size)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct SchemeKey {
+    dt: DigitLayout,
+    m: usize,
+    n: usize,
 }
 
 #[cfg(test)]
@@ -172,7 +208,7 @@ mod test {
             test_utils::{Diff, ErrorCollector},
             Operator as _,
         };
-        use clrt::{Invalid, Platform};
+        use clrt::Platform;
         use digit_layout::types::{F32, F64};
         use rand::Rng;
         use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
@@ -185,31 +221,27 @@ mod test {
 
                 let context = device.context();
                 let queue = context.queue();
-                let cl_op = Operator::new(&ClDevice::new(context.clone()));
+                let cl_op = Operator::new(&ClDevice::new(context.clone(), Default::default()));
 
                 let batch = 4;
-                // let k = 2048;
-                // let n = 5632;
                 let k = 9;
                 let n = 64;
                 for m in [8] {
-                    // for m in [1, 7, 64, 255, 1024] {
                     let mut a = vec![0.0f64; batch * m * k];
                     let mut b = vec![0.0f64; batch * k * n];
                     let mut c = vec![0.0f64; batch * m * n];
 
-                    rand::thread_rng().fill(&mut a[..]);
-                    rand::thread_rng().fill(&mut b[..]);
-                    rand::thread_rng().fill(&mut c[..]);
+                    rand::rng().fill(&mut a[..]);
+                    rand::rng().fill(&mut b[..]);
+                    rand::rng().fill(&mut c[..]);
 
                     let a = a;
                     let b = b;
                     let mut a_svm = context.malloc::<f32>(batch * m * k);
                     let mut b_svm = context.malloc::<f32>(batch * k * n);
 
-                    let mut map = queue.map_mut(&mut a_svm, Invalid);
-                    let ([], mem, []) = (unsafe { map.write_only_slice().align_to_mut::<f32>() })
-                    else {
+                    let mut map = queue.map_mut(&mut a_svm, false);
+                    let ([], mem, []) = (unsafe { map.align_to_mut::<f32>() }) else {
                         panic!()
                     };
                     for (dst, src) in zip(mem, &a) {
@@ -217,9 +249,8 @@ mod test {
                     }
                     queue.unmap(map);
 
-                    let mut map = queue.map_mut(&mut b_svm, Invalid);
-                    let ([], mem, []) = (unsafe { map.write_only_slice().align_to_mut::<f32>() })
-                    else {
+                    let mut map = queue.map_mut(&mut b_svm, false);
+                    let ([], mem, []) = (unsafe { map.align_to_mut::<f32>() }) else {
                         panic!()
                     };
                     for (dst, src) in zip(mem, &b) {
@@ -228,9 +259,8 @@ mod test {
                     queue.unmap(map);
 
                     let mut c_svm = context.malloc::<f32>(batch * m * n);
-                    let mut map = queue.map_mut(&mut c_svm, Invalid);
-                    let ([], mem, []) = (unsafe { map.write_only_slice().align_to_mut::<f32>() })
-                    else {
+                    let mut map = queue.map_mut(&mut c_svm, false);
+                    let ([], mem, []) = (unsafe { map.align_to_mut::<f32>() }) else {
                         panic!()
                     };
                     for (dst, src) in zip(mem, &c) {
