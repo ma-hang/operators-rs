@@ -81,16 +81,63 @@ impl crate::Operator for Operator {
         let (lhs_cs, lhs_rs) = if a_trans { (1, a_ld) } else { (a_ld, 1) };
         let (rhs_cs, rhs_rs) = if b_trans { (1, b_ld) } else { (b_ld, 1) };
 
-        let mn = m * n;
-
         let (key, groupsize) = self.cache_kernel(dt, m, n);
+        let mut mn = m * n;
+        let mut kernel_id = 1;
+        let mut new_groupsize = groupsize;
+
+        if dt != Ty::F32 {
+            if lhs_cs == 1 && rhs_rs == 1 && n == 1 {
+                new_groupsize = 1024;
+                if m % (new_groupsize / 128) == 0 {
+                    kernel_id = if k % 512 == 0 {
+                        mn *= 128;
+                        2
+                    }
+                    // else
+                    // if k % 256 == 0 && m % (new_groupsize / 64) == 0 {
+                    //     mn *= 64;
+                    //     3
+                    // }
+                    //  else if k % 256 == 0 {
+                    //     mn *= 128;
+                    //     4
+                    // } else if k % 128 == 0 && m % (new_groupsize / 64) == 0 {
+                    //     mn *= 64;
+                    //     5
+                    // }
+                    else {
+                        kernel_id
+                    };
+                } else if m == 122753 {
+                    // let set = new_groupsize / 64 - 1;
+                    // let result = (m + set) & !set;
+                    // mn = result * n * 64;
+                    // kernel_id = 3;
+                    kernel_id = 1;
+                }
+            }
+        }
+        // println!("{}", kernel_id);
+        if kernel_id == 1 {
+            new_groupsize = groupsize;
+        }
+        let scheme_name = match kernel_id {
+            1 => "general_gemm",
+            2 => "gemm_f16_v1",
+            3 => "gemm_f16_v2",
+            4 => "gemm_f16_v3",
+            5 => "gemm_f16_v4",
+            _ => unreachable!("Invalid kernel_id value: {}", kernel_id),
+        };
+
         let mut matmul = self
             .schemes
             .lock()
             .unwrap()
             .get(&key)
             .unwrap()
-            .take("general_gemm")
+            .take(scheme_name)
             .unwrap();
 
         let queue = _queue_alloc.queue();
@@ -113,10 +160,21 @@ impl crate::Operator for Operator {
             .set_arg(15, k as cl_int)
             .set_arg(16, alpha)
             .set_arg(17, beta)
-            .launch(&[0, 0], &[batch, mn], &[1, groupsize], queue, None);
+            // .launch(&[0, 0], &[batch, mn], &[1, new_groupsize], queue, None);
+            .launch(&[0, 0], &[mn, batch], &[new_groupsize, 1], queue, None);
         let mut cache = self.schemes.lock().unwrap();
         let program = cache.get(&key).unwrap();
-        program.put("general_gemm", matmul);
+        if kernel_id == 1 {
+            program.put("general_gemm", matmul);
+        } else if kernel_id == 2 {
+            program.put("gemm_f16_v1", matmul);
+        } else if kernel_id == 3 {
+            program.put("gemm_f16_v2", matmul);
+        } else if kernel_id == 4 {
+            program.put("gemm_f16_v3", matmul);
+        } else if kernel_id == 5 {
+            program.put("gemm_f16_v4", matmul);
+        }
         Ok(())
     }
 }
